@@ -1,13 +1,14 @@
 # xero-expenses-mcp
 
-MCP (Model Context Protocol) server for Xero expense management. Supports Bills, Expenses (Bank Transactions), and Expense Claims with PKCE authentication.
+MCP (Model Context Protocol) server for Xero accounting. Supports Invoices, Bills, Expenses (Bank Transactions), and Expense Claims with PKCE authentication.
 
 ## Features
 
-- **Bills (ACCPAY)** - Create invoices you'll pay later
+- **Invoices (ACCREC)** - Create sales invoices to send to customers
+- **Bills (ACCPAY)** - Create bills you'll pay later
 - **Expenses** - Create "Spend Money" bank transactions for already-paid expenses
 - **Expense Claims** - Create receipts and submit expense claims for reimbursement
-- **Attachments** - Attach PDFs and images to bills, expenses, and receipts
+- **Attachments** - Attach PDFs and images to invoices, bills, expenses, and receipts
 - **PKCE Auth** - Desktop app OAuth flow (no client secret required)
 
 ## Installation
@@ -76,6 +77,10 @@ On first use, the server will open a browser for Xero OAuth. After authenticatin
 - `xero_list_bank_accounts` - List bank accounts
 - `xero_list_contacts` - Search vendors/contacts
 - `xero_list_users` - List organization users (for expense claims)
+
+### Invoices (Accounts Receivable)
+- `xero_create_invoice` - Create a sales invoice to send to customers
+- `xero_attach_file_to_invoice` - Attach file to an invoice
 
 ### Bills (Accounts Payable)
 - `xero_create_bill` - Create a bill for future payment
