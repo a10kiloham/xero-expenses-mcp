@@ -1,0 +1,35 @@
+{
+  "name": "xero-expenses-mcp",
+  "version": "0.1.0",
+  "description": "MCP server for Xero expense management - bills, expenses, expense claims with PKCE auth",
+  "type": "module",
+  "main": "index.js",
+  "bin": {
+    "xero-expenses-mcp": "./index.js"
+  },
+  "scripts": {
+    "start": "node index.js"
+  },
+  "keywords": [
+    "mcp",
+    "xero",
+    "expenses",
+    "accounting",
+    "claude",
+    "model-context-protocol"
+  ],
+  "author": "muness",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/muness/xero-expenses-mcp"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.24.3",
+    "open": "^10.1.0",
+    "xero-node": "^13.3.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
