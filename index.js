@@ -299,6 +299,144 @@ class XeroExpensesMCP {
     };
   }
 
+  async listDraftBills({ reference } = {}) {
+    await this.ensureAuthenticated();
+
+    // Get DRAFT bills (ACCPAY invoices)
+    let where = 'Type=="ACCPAY" AND Status=="DRAFT"';
+    if (reference) {
+      where += ` AND Reference.Contains("${reference}")`;
+    }
+
+    const response = await this.xero.accountingApi.getInvoices(
+      this.tenantId,
+      null, // ifModifiedSince
+      where,
+      'Date DESC', // order
+      null, // IDs
+      null, // invoiceNumbers
+      null, // contactIDs
+      null, // statuses
+      1,    // page
+      false // includeArchived
+    );
+
+    return (response.body.invoices || []).map(inv => ({
+      invoiceId: inv.invoiceID,
+      invoiceNumber: inv.invoiceNumber,
+      reference: inv.reference,
+      vendor: inv.contact?.name,
+      total: inv.total,
+      status: inv.status,
+      date: inv.date,
+      lineItemCount: inv.lineItems?.length || 0,
+    }));
+  }
+
+  async getBill(invoiceId) {
+    await this.ensureAuthenticated();
+
+    const response = await this.xero.accountingApi.getInvoice(this.tenantId, invoiceId);
+    const inv = response.body.invoices[0];
+
+    return {
+      invoiceId: inv.invoiceID,
+      invoiceNumber: inv.invoiceNumber,
+      reference: inv.reference,
+      vendor: inv.contact?.name,
+      contactId: inv.contact?.contactID,
+      total: inv.total,
+      status: inv.status,
+      date: inv.date,
+      dueDate: inv.dueDate,
+      lineItems: (inv.lineItems || []).map(li => ({
+        lineItemId: li.lineItemID,
+        description: li.description,
+        quantity: li.quantity,
+        unitAmount: li.unitAmount,
+        accountCode: li.accountCode,
+        lineAmount: li.lineAmount,
+      })),
+    };
+  }
+
+  async addLineItemToBill(invoiceId, { description, amount, accountCode, reference }) {
+    await this.ensureAuthenticated();
+
+    // Get existing bill
+    const existingResponse = await this.xero.accountingApi.getInvoice(this.tenantId, invoiceId);
+    const existing = existingResponse.body.invoices[0];
+
+    if (existing.status !== 'DRAFT') {
+      throw new Error(`Cannot add line items to bill with status ${existing.status}. Bill must be DRAFT.`);
+    }
+
+    // Add new line item to existing ones
+    const updatedLineItems = [
+      ...existing.lineItems,
+      {
+        description: description || "Expense",
+        quantity: 1,
+        unitAmount: amount,
+        accountCode: accountCode || "400",
+      },
+    ];
+
+    // Update the bill
+    const updatedBill = {
+      invoiceID: invoiceId,
+      lineItems: updatedLineItems,
+      // Optionally append to reference
+      reference: reference
+        ? (existing.reference ? `${existing.reference}; ${reference}` : reference)
+        : existing.reference,
+    };
+
+    const response = await this.xero.accountingApi.updateInvoice(
+      this.tenantId,
+      invoiceId,
+      { invoices: [updatedBill] }
+    );
+    const updated = response.body.invoices[0];
+
+    return {
+      invoiceId: updated.invoiceID,
+      invoiceNumber: updated.invoiceNumber,
+      reference: updated.reference,
+      vendor: updated.contact?.name,
+      total: updated.total,
+      status: updated.status,
+      lineItemCount: updated.lineItems?.length || 0,
+    };
+  }
+
+  async submitBill(invoiceId) {
+    await this.ensureAuthenticated();
+
+    // Change status from DRAFT to SUBMITTED
+    const updatedBill = {
+      invoiceID: invoiceId,
+      status: 'SUBMITTED',
+    };
+
+    const response = await this.xero.accountingApi.updateInvoice(
+      this.tenantId,
+      invoiceId,
+      { invoices: [updatedBill] }
+    );
+    const updated = response.body.invoices[0];
+
+    return {
+      invoiceId: updated.invoiceID,
+      invoiceNumber: updated.invoiceNumber,
+      reference: updated.reference,
+      vendor: updated.contact?.name,
+      total: updated.total,
+      status: updated.status,
+      lineItemCount: updated.lineItems?.length || 0,
+    };
+  }
+
   async attachFileToBill(invoiceId, filePath) {
     await this.ensureAuthenticated();
 
@@ -403,12 +541,16 @@ class XeroExpensesMCP {
     };
     const mimeType = mimeTypes[ext] || 'application/octet-stream';
 
+    // Generate unique idempotency key to avoid conflicts
+    const idempotencyKey = `expense-${bankTransactionId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
     const response = await this.xero.accountingApi.createBankTransactionAttachmentByFileName(
       this.tenantId,
       bankTransactionId,
       fileName,
       fileContent,
-      mimeType
+      idempotencyKey,
+      { headers: { 'Content-Type': mimeType } }
     );
 
     return {
@@ -628,6 +770,124 @@ class XeroExpensesMCP {
       success: true,
     };
   }
+
+  async listExpenseClaims(status) {
+    await this.ensureAuthenticated();
+
+    // status can be: SUBMITTED, AUTHORISED, PAID
+    const where = status ? `Status=="${status}"` : undefined;
+
+    const response = await this.xero.accountingApi.getExpenseClaims(
+      this.tenantId,
+      undefined, // ifModifiedSince
+      where,
+      undefined, // order
+    );
+
+    return response.body.expenseClaims.map(c => ({
+      expenseClaimId: c.expenseClaimID,
+      status: c.status,
+      total: c.total,
+      userId: c.user?.userID,
+      userName: c.user ? `${c.user.firstName} ${c.user.lastName}` : undefined,
+      receipts: c.receipts?.map(r => ({
+        receiptId: r.receiptID,
+        date: r.date,
+        total: r.total,
+        contact: r.contact?.name,
+      })),
+      updatedDate: c.updatedDateUTC,
+    }));
+  }
+
+  async getExpenseClaim(expenseClaimId) {
+    await this.ensureAuthenticated();
+
+    const response = await this.xero.accountingApi.getExpenseClaim(
+      this.tenantId,
+      expenseClaimId
+    );
+
+    const c = response.body.expenseClaims[0];
+    return {
+      expenseClaimId: c.expenseClaimID,
+      status: c.status,
+      total: c.total,
+      userId: c.user?.userID,
+      userName: c.user ? `${c.user.firstName} ${c.user.lastName}` : undefined,
+      receipts: c.receipts?.map(r => ({
+        receiptId: r.receiptID,
+        receiptNumber: r.receiptNumber,
+        date: r.date,
+        total: r.total,
+        contact: r.contact?.name,
+        reference: r.reference,
+        lineItems: r.lineItems?.map(li => ({
+          description: li.description,
+          amount: li.unitAmount,
+          accountCode: li.accountCode,
+        })),
+      })),
+    };
+  }
+
+  async deleteExpenseClaim(expenseClaimId) {
+    await this.ensureAuthenticated();
+
+    // Get the claim first to return receipt info
+    const claim = await this.getExpenseClaim(expenseClaimId);
+    const receiptIds = claim.receipts?.map(r => r.receiptId) || [];
+
+    // Delete by updating status - Xero doesn't have direct delete
+    // We can only delete SUBMITTED claims by setting status to DELETED (if supported)
+    // Or we need to void/cancel it
+    // Actually, for SUBMITTED claims we can update them
+
+    // Try to update the claim to remove receipts (effectively deleting it)
+    // The Xero API behavior: deleting an expense claim keeps the receipts
+    try {
+      const expenseClaim = {
+        expenseClaimID: expenseClaimId,
+        status: "SUBMITTED", // Keep submitted but we'll handle this differently
+      };
+
+      // Actually, let's try the proper approach - Xero might support deletion
+      // For now, return the receipt IDs so they can be re-used
+      return {
+        deleted: false,
+        message: "Xero API does not support direct expense claim deletion. Please delete manually in Xero, then receipts can be re-submitted.",
+        expenseClaimId: expenseClaimId,
+        receiptIds: receiptIds,
+      };
+    } catch (error) {
+      throw error;
+    }
+  }
+
+  async listReceipts(userId) {
+    await this.ensureAuthenticated();
+
+    const where = userId ? `User.UserID=GUID("${userId}")` : undefined;
+
+    const response = await this.xero.accountingApi.getReceipts(
+      this.tenantId,
+      undefined, // ifModifiedSince
+      where,
+      undefined, // order
+    );
+
+    return response.body.receipts.map(r => ({
+      receiptId: r.receiptID,
+      receiptNumber: r.receiptNumber,
+      status: r.status,
+      date: r.date,
+      total: r.total,
+      contact: r.contact?.name,
+      reference: r.reference,
+      userId: r.user?.userID,
+      hasAttachments: r.hasAttachments,
+    }));
+  }
 }
 
 // MCP Server setup
@@ -676,6 +936,53 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
           reference: { type: "string", description: "Reference number from the invoice" },
         },
         required: ["vendorName", "amount", "description"],
+      },
+    },
+    {
+      name: "xero_list_draft_bills",
+      description: "List draft bills (ACCPAY invoices) - use to find existing draft to add expenses to",
+      inputSchema: {
+        type: "object",
+        properties: {
+          reference: { type: "string", description: "Optional reference pattern to filter by" },
+        },
+      },
+    },
+    {
+      name: "xero_get_bill",
+      description: "Get details of a specific bill including all line items",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: { type: "string", description: "The Xero invoice/bill ID" },
+        },
+        required: ["invoiceId"],
+      },
+    },
+    {
+      name: "xero_add_line_item_to_bill",
+      description: "Add a line item (expense) to an existing DRAFT bill",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: { type: "string", description: "The Xero invoice/bill ID" },
+          description: { type: "string", description: "Description of the expense" },
+          amount: { type: "number", description: "Amount of the expense" },
+          accountCode: { type: "string", description: "Xero account code (e.g., '678' for software)" },
+          reference: { type: "string", description: "Reference to append (e.g., invoice number)" },
+        },
+        required: ["invoiceId", "description", "amount", "accountCode"],
+      },
+    },
+    {
+      name: "xero_submit_bill",
+      description: "Change a DRAFT bill to SUBMITTED status for approval",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: { type: "string", description: "The Xero invoice/bill ID" },
+        },
+        required: ["invoiceId"],
       },
     },
     {
@@ -785,6 +1092,71 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ["invoiceId", "filePath"],
       },
     },
+    {
+      name: "xero_create_receipt",
+      description: "Create a receipt WITHOUT submitting as expense claim - use this to batch multiple receipts into one claim later",
+      inputSchema: {
+        type: "object",
+        properties: {
+          vendorName: { type: "string", description: "Name of the vendor" },
+          vendorEmail: { type: "string", description: "Email of the vendor (optional)" },
+          amount: { type: "number", description: "Total amount of the expense" },
+          description: { type: "string", description: "Description of the expense" },
+          accountCode: { type: "string", description: "Xero expense account code (e.g., '620' for meals)" },
+          date: { type: "string", description: "Receipt date (YYYY-MM-DD)" },
+          reference: { type: "string", description: "Reference number from the receipt" },
+          userId: { type: "string", description: "Xero user ID (optional, uses first user if not specified)" },
+        },
+        required: ["vendorName", "amount", "description"],
+      },
+    },
+    {
+      name: "xero_submit_expense_claim",
+      description: "Submit multiple receipts as a single expense claim - use after creating receipts with xero_create_receipt",
+      inputSchema: {
+        type: "object",
+        properties: {
+          receiptIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Array of receipt IDs to include in the claim"
+          },
+          userId: { type: "string", description: "Xero user ID (optional, uses first user if not specified)" },
+        },
+        required: ["receiptIds"],
+      },
+    },
+    {
+      name: "xero_list_expense_claims",
+      description: "List expense claims - optionally filter by status (SUBMITTED, AUTHORISED, PAID)",
+      inputSchema: {
+        type: "object",
+        properties: {
+          status: { type: "string", description: "Filter by status: SUBMITTED, AUTHORISED, or PAID" },
+        },
+      },
+    },
+    {
+      name: "xero_get_expense_claim",
+      description: "Get details of a specific expense claim including all receipts",
+      inputSchema: {
+        type: "object",
+        properties: {
+          expenseClaimId: { type: "string", description: "The expense claim ID" },
+        },
+        required: ["expenseClaimId"],
+      },
+    },
+    {
+      name: "xero_list_receipts",
+      description: "List all receipts - optionally filter by user ID",
+      inputSchema: {
+        type: "object",
+        properties: {
+          userId: { type: "string", description: "Filter by user ID (optional)" },
+        },
+      },
+    },
   ],
 }));
 
@@ -817,6 +1189,39 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "xero_create_bill": {
         const result = await xeroExpenses.createBill(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_list_draft_bills": {
+        const result = await xeroExpenses.listDraftBills(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_get_bill": {
+        const result = await xeroExpenses.getBill(args.invoiceId);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_add_line_item_to_bill": {
+        const result = await xeroExpenses.addLineItemToBill(args.invoiceId, {
+          description: args.description,
+          amount: args.amount,
+          accountCode: args.accountCode,
+          reference: args.reference,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_submit_bill": {
+        const result = await xeroExpenses.submitBill(args.invoiceId);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
@@ -873,6 +1278,44 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "xero_attach_file_to_invoice": {
         const result = await xeroExpenses.attachFileToInvoice(args.invoiceId, args.filePath);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_create_receipt": {
+        const result = await xeroExpenses.createReceipt(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_submit_expense_claim": {
+        const result = await xeroExpenses.createExpenseClaim({
+          receiptIds: args.receiptIds,
+          userId: args.userId,
+        });
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_list_expense_claims": {
+        const result = await xeroExpenses.listExpenseClaims(args.status);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_get_expense_claim": {
+        const result = await xeroExpenses.getExpenseClaim(args.expenseClaimId);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_list_receipts": {
+        const result = await xeroExpenses.listReceipts(args.userId);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
