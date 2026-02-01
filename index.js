@@ -454,13 +454,17 @@ class XeroExpensesMCP {
     };
     const mimeType = mimeTypes[ext] || 'application/octet-stream';
 
+    // Generate unique idempotency key to avoid conflicts
+    const idempotencyKey = `bill-${invoiceId}-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+
     const response = await this.xero.accountingApi.createInvoiceAttachmentByFileName(
       this.tenantId,
       invoiceId,
       fileName,
       fileContent,
       true, // includeOnline
-      mimeType
+      idempotencyKey,
+      { headers: { 'Content-Type': mimeType } }
     );
 
     return {
@@ -688,7 +692,7 @@ class XeroExpensesMCP {
     };
   }
 
-  async createInvoice({ customerName, customerEmail, amount, description, accountCode, date, dueDate, reference }) {
+  async createInvoice({ customerName, customerEmail, quantity, unitPrice, description, accountCode, date, dueDate, reference }) {
     await this.ensureAuthenticated();
 
     // Find or create contact
@@ -709,8 +713,8 @@ class XeroExpensesMCP {
       lineItems: [
         {
           description: description || "Services",
-          quantity: 1,
-          unitAmount: amount,
+          quantity: quantity || 1,
+          unitAmount: unitPrice,
           accountCode: accountCode || "200", // Default revenue account
         },
       ],
@@ -922,7 +926,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "xero_create_bill",
-      description: "Create a bill (accounts payable) in Xero - use for invoices you'll pay later",
+      description: "Create a bill (accounts payable) in Xero - use for invoices you'll pay later. NOTE: Xero has a 10 attachment limit per bill, so create multiple bills with ≤9 line items each when processing many expenses.",
       inputSchema: {
         type: "object",
         properties: {
@@ -961,7 +965,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "xero_add_line_item_to_bill",
-      description: "Add a line item (expense) to an existing DRAFT bill",
+      description: "Add a line item (expense) to an existing DRAFT bill. NOTE: Keep ≤9 line items per bill due to Xero's 10 attachment limit.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1005,7 +1009,7 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "xero_attach_file",
-      description: "Attach a file (PDF, image) to an existing Xero bill",
+      description: "Attach a file (PDF, image) to an existing Xero bill. NOTE: Xero has a 10 attachment limit per bill - create multiple bills if you have more than 9 expenses.",
       inputSchema: {
         type: "object",
         properties: {
@@ -1070,14 +1074,15 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         properties: {
           customerName: { type: "string", description: "Name of the customer" },
           customerEmail: { type: "string", description: "Email of the customer (optional)" },
-          amount: { type: "number", description: "Total amount of the invoice" },
+          quantity: { type: "number", description: "Quantity (e.g., hours worked)" },
+          unitPrice: { type: "number", description: "Price per unit (e.g., hourly rate)" },
           description: { type: "string", description: "Description of the goods/services" },
           accountCode: { type: "string", description: "Xero revenue account code (e.g., '200' for sales)" },
           date: { type: "string", description: "Invoice date (YYYY-MM-DD)" },
           dueDate: { type: "string", description: "Due date (YYYY-MM-DD)" },
           reference: { type: "string", description: "Reference or PO number" },
         },
-        required: ["customerName", "amount", "description"],
+        required: ["customerName", "quantity", "unitPrice", "description"],
       },
     },
     {
