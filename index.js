@@ -360,7 +360,7 @@ class XeroExpensesMCP {
     };
   }
 
-  async addLineItemToBill(invoiceId, { description, amount, accountCode, reference }) {
+  async addLineItemToBill(invoiceId, { description, amount, quantity, unitPrice, accountCode, reference }) {
     await this.ensureAuthenticated();
 
     // Get existing bill
@@ -371,15 +371,23 @@ class XeroExpensesMCP {
       throw new Error(`Cannot add line items to bill with status ${existing.status}. Bill must be DRAFT.`);
     }
 
+    // Build line item: prefer quantity × unitPrice, fall back to flat amount
+    const lineItem = {
+      description: description || "Expense",
+      accountCode: accountCode || "400",
+    };
+    if (quantity != null && unitPrice != null) {
+      lineItem.quantity = quantity;
+      lineItem.unitAmount = unitPrice;
+    } else {
+      lineItem.quantity = 1;
+      lineItem.unitAmount = amount;
+    }
+
     // Add new line item to existing ones
     const updatedLineItems = [
       ...existing.lineItems,
-      {
-        description: description || "Expense",
-        quantity: 1,
-        unitAmount: amount,
-        accountCode: accountCode || "400",
-      },
+      lineItem,
     ];
 
     // Update the bill
@@ -965,17 +973,19 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
     },
     {
       name: "xero_add_line_item_to_bill",
-      description: "Add a line item (expense) to an existing DRAFT bill. NOTE: Keep ≤9 line items per bill due to Xero's 10 attachment limit.",
+      description: "Add a line item to an existing DRAFT bill or invoice. Supports both flat amount (amount) and quantity × unit price (quantity + unitPrice). NOTE: Keep ≤9 line items per bill due to Xero's 10 attachment limit.",
       inputSchema: {
         type: "object",
         properties: {
           invoiceId: { type: "string", description: "The Xero invoice/bill ID" },
-          description: { type: "string", description: "Description of the expense" },
-          amount: { type: "number", description: "Amount of the expense" },
-          accountCode: { type: "string", description: "Xero account code (e.g., '678' for software)" },
+          description: { type: "string", description: "Description of the line item" },
+          amount: { type: "number", description: "Flat amount (used when quantity/unitPrice not provided)" },
+          quantity: { type: "number", description: "Quantity (e.g., hours worked). Use with unitPrice." },
+          unitPrice: { type: "number", description: "Price per unit (e.g., hourly rate). Use with quantity." },
+          accountCode: { type: "string", description: "Xero account code (e.g., '678' for software, '200' for sales)" },
           reference: { type: "string", description: "Reference to append (e.g., invoice number)" },
         },
-        required: ["invoiceId", "description", "amount", "accountCode"],
+        required: ["invoiceId", "description", "accountCode"],
       },
     },
     {
@@ -1217,6 +1227,8 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
         const result = await xeroExpenses.addLineItemToBill(args.invoiceId, {
           description: args.description,
           amount: args.amount,
+          quantity: args.quantity,
+          unitPrice: args.unitPrice,
           accountCode: args.accountCode,
           reference: args.reference,
         });
