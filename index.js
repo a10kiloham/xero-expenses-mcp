@@ -743,6 +743,180 @@ class XeroExpensesMCP {
     };
   }
 
+  async listDraftInvoices({ reference, customerName } = {}) {
+    await this.ensureAuthenticated();
+
+    const response = await this.xero.accountingApi.getInvoices(
+      this.tenantId,
+      null, // ifModifiedSince
+      'Type=="ACCREC" AND Status=="DRAFT"',
+      'Date DESC', // order
+      null, // IDs
+      null, // invoiceNumbers
+      null, // contactIDs
+      null, // statuses
+      1,    // page
+      false // includeArchived
+    );
+
+    let invoices = response.body.invoices || [];
+    if (reference) {
+      const needle = reference.toLowerCase();
+      invoices = invoices.filter(inv => (inv.reference || '').toLowerCase().includes(needle));
+    }
+    if (customerName) {
+      const needle = customerName.toLowerCase();
+      invoices = invoices.filter(inv => (inv.contact?.name || '').toLowerCase().includes(needle));
+    }
+
+    return invoices.map(inv => ({
+      invoiceId: inv.invoiceID,
+      invoiceNumber: inv.invoiceNumber,
+      reference: inv.reference,
+      customer: inv.contact?.name,
+      total: inv.total,
+      status: inv.status,
+      date: inv.date,
+      dueDate: inv.dueDate,
+      lineItemCount: inv.lineItems?.length || 0,
+    }));
+  }
+
+  async getInvoice(invoiceId) {
+    await this.ensureAuthenticated();
+
+    const response = await this.xero.accountingApi.getInvoice(this.tenantId, invoiceId);
+    const inv = response.body.invoices[0];
+
+    return {
+      invoiceId: inv.invoiceID,
+      invoiceNumber: inv.invoiceNumber,
+      reference: inv.reference,
+      customer: inv.contact?.name,
+      contactId: inv.contact?.contactID,
+      type: inv.type,
+      total: inv.total,
+      status: inv.status,
+      date: inv.date,
+      dueDate: inv.dueDate,
+      lineItems: (inv.lineItems || []).map(li => ({
+        lineItemId: li.lineItemID,
+        description: li.description,
+        quantity: li.quantity,
+        unitAmount: li.unitAmount,
+        accountCode: li.accountCode,
+        lineAmount: li.lineAmount,
+      })),
+    };
+  }
+
+  async updateDraftInvoice(invoiceId, { customerName, customerEmail, quantity, unitPrice, description, accountCode, date, dueDate, reference }) {
+    await this.ensureAuthenticated();
+
+    const existingResponse = await this.xero.accountingApi.getInvoice(this.tenantId, invoiceId);
+    const existing = existingResponse.body.invoices[0];
+
+    if (existing.type !== 'ACCREC') {
+      throw new Error(`Cannot update invoice ${invoiceId}: expected ACCREC sales invoice, got ${existing.type}.`);
+    }
+    if (existing.status !== 'DRAFT') {
+      throw new Error(`Cannot update invoice ${invoiceId} with status ${existing.status}. Invoice must be DRAFT.`);
+    }
+
+    let contactId = existing.contact?.contactID;
+    if (customerName) {
+      let contacts = await this.listContacts(customerName);
+      let contact = contacts.find(c => c.name.toLowerCase() === customerName.toLowerCase());
+      if (!contact) {
+        contact = await this.createContact(customerName, customerEmail || undefined);
+      }
+      contactId = contact.contactId;
+    }
+    if (!contactId) {
+      throw new Error(`Cannot update invoice ${invoiceId}: invoice has no contact ID and no replacement customerName was provided.`);
+    }
+
+    const firstLine = existing.lineItems?.[0] || {};
+    const lineItem = {
+      description: description ?? firstLine.description ?? 'Services',
+      quantity: quantity ?? firstLine.quantity ?? 1,
+      unitAmount: unitPrice ?? firstLine.unitAmount,
+      accountCode: accountCode ?? firstLine.accountCode ?? '200',
+    };
+
+    if (lineItem.unitAmount == null) {
+      throw new Error('unitPrice is required when the existing invoice line item has no unit amount.');
+    }
+
+    const updatedInvoice = {
+      invoiceID: invoiceId,
+      type: 'ACCREC',
+      contact: { contactID: contactId },
+      lineItems: [lineItem],
+      status: 'DRAFT',
+    };
+
+    if (date) updatedInvoice.date = date;
+    if (dueDate) updatedInvoice.dueDate = dueDate;
+    if (reference !== undefined) updatedInvoice.reference = reference;
+
+    const response = await this.xero.accountingApi.updateInvoice(
+      this.tenantId,
+      invoiceId,
+      { invoices: [updatedInvoice] }
+    );
+    const updated = response.body.invoices[0];
+
+    return {
+      invoiceId: updated.invoiceID,
+      invoiceNumber: updated.invoiceNumber,
+      reference: updated.reference,
+      customer: updated.contact?.name,
+      total: updated.total,
+      status: updated.status,
+      date: updated.date,
+      dueDate: updated.dueDate,
+      lineItemCount: updated.lineItems?.length || 0,
+      lineItems: (updated.lineItems || []).map(li => ({
+        description: li.description,
+        quantity: li.quantity,
+        unitAmount: li.unitAmount,
+        accountCode: li.accountCode,
+        lineAmount: li.lineAmount,
+      })),
+    };
+  }
+
+  async deleteDraftInvoice(invoiceId) {
+    await this.ensureAuthenticated();
+
+    const existingResponse = await this.xero.accountingApi.getInvoice(this.tenantId, invoiceId);
+    const existing = existingResponse.body.invoices[0];
+
+    if (existing.type !== 'ACCREC') {
+      throw new Error(`Cannot delete invoice ${invoiceId}: expected ACCREC sales invoice, got ${existing.type}.`);
+    }
+    if (existing.status !== 'DRAFT') {
+      throw new Error(`Cannot delete invoice ${invoiceId} with status ${existing.status}. Invoice must be DRAFT.`);
+    }
+
+    const response = await this.xero.accountingApi.updateInvoice(
+      this.tenantId,
+      invoiceId,
+      { invoices: [{ invoiceID: invoiceId, status: 'DELETED' }] }
+    );
+    const deleted = response.body.invoices[0];
+
+    return {
+      invoiceId: deleted.invoiceID,
+      invoiceNumber: deleted.invoiceNumber,
+      reference: deleted.reference,
+      customer: deleted.contact?.name,
+      total: deleted.total,
+      status: deleted.status,
+    };
+  }
+
   async attachFileToInvoice(invoiceId, filePath) {
     // Same as attachFileToBill - invoices and bills use same attachment API
     return this.attachFileToBill(invoiceId, filePath);
@@ -1096,6 +1270,59 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
       },
     },
     {
+      name: "xero_list_draft_invoices",
+      description: "List draft sales invoices (accounts receivable), optionally filtered by customer name or reference",
+      inputSchema: {
+        type: "object",
+        properties: {
+          customerName: { type: "string", description: "Optional customer name filter" },
+          reference: { type: "string", description: "Optional invoice reference filter" },
+        },
+      },
+    },
+    {
+      name: "xero_get_invoice",
+      description: "Get details of a sales invoice including line items",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: { type: "string", description: "The Xero invoice ID" },
+        },
+        required: ["invoiceId"],
+      },
+    },
+    {
+      name: "xero_update_draft_invoice",
+      description: "Update a DRAFT sales invoice as one consolidated invoice with one line item",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: { type: "string", description: "The Xero invoice ID" },
+          customerName: { type: "string", description: "Name of the customer (optional; existing contact is kept when omitted)" },
+          customerEmail: { type: "string", description: "Email of the customer (optional)" },
+          quantity: { type: "number", description: "Quantity (e.g., total hours worked)" },
+          unitPrice: { type: "number", description: "Price per unit (e.g., hourly rate)" },
+          description: { type: "string", description: "Description of the goods/services" },
+          accountCode: { type: "string", description: "Xero revenue account code (e.g., '200' for sales)" },
+          date: { type: "string", description: "Invoice date (YYYY-MM-DD)" },
+          dueDate: { type: "string", description: "Due date (YYYY-MM-DD)" },
+          reference: { type: "string", description: "Reference or PO number" },
+        },
+        required: ["invoiceId"],
+      },
+    },
+    {
+      name: "xero_delete_draft_invoice",
+      description: "Delete a DRAFT sales invoice in Xero",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: { type: "string", description: "The Xero invoice ID" },
+        },
+        required: ["invoiceId"],
+      },
+    },
+    {
       name: "xero_attach_file_to_invoice",
       description: "Attach a file (PDF, image) to an existing Xero invoice",
       inputSchema: {
@@ -1288,6 +1515,34 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "xero_create_invoice": {
         const result = await xeroExpenses.createInvoice(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_list_draft_invoices": {
+        const result = await xeroExpenses.listDraftInvoices(args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_get_invoice": {
+        const result = await xeroExpenses.getInvoice(args.invoiceId);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_update_draft_invoice": {
+        const result = await xeroExpenses.updateDraftInvoice(args.invoiceId, args);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_delete_draft_invoice": {
+        const result = await xeroExpenses.deleteDraftInvoice(args.invoiceId);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
