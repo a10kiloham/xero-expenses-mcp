@@ -56,12 +56,9 @@ class XeroExpensesMCP {
         "accounting.payments",
         "accounting.banktransactions",
         "accounting.manualjournals",
-        "accounting.reports",
+        "accounting.contacts",
         "accounting.settings",
         "accounting.attachments",
-        "accounting.contacts",
-        "files",
-        "bankfeeds",
         "offline_access"
       ],
     };
@@ -75,6 +72,7 @@ class XeroExpensesMCP {
     this.xero = new XeroClient(config);
     this.scopes = config.scopes;
     this.tenantId = null;
+    this.callbackServer = null;
 
     // Ensure token directory exists
     if (!existsSync(TOKEN_DIR)) {
@@ -108,6 +106,13 @@ class XeroExpensesMCP {
   }
 
   async authenticate() {
+    // If a callback server is already running, auth is already in progress
+    if (this.callbackServer) {
+      throw new Error(
+        "Xero authentication is already in progress. Please complete the sign-in in the browser window that was opened, then retry this tool call."
+      );
+    }
+
     const redirectUri = process.env.XERO_REDIRECT_URI || "http://localhost:3000/callback";
     const clientId = process.env.XERO_CLIENT_ID;
     const clientSecret = process.env.XERO_CLIENT_SECRET;
@@ -128,74 +133,87 @@ class XeroExpensesMCP {
     authUrl.searchParams.set("code_challenge", codeChallenge);
     authUrl.searchParams.set("code_challenge_method", "S256");
 
-    return new Promise((resolve, reject) => {
-      const server = createServer(async (req, res) => {
-        const url = new URL(req.url, `http://localhost:${port}`);
+    // Start the callback server in the background (non-blocking).
+    // The tool call returns immediately with an instructional error so the MCP
+    // host does not time out. Once the user completes OAuth in the browser the
+    // tokens are saved, and the next tool call will succeed.
+    this.callbackServer = createServer(async (req, res) => {
+      const url = new URL(req.url, `http://localhost:${port}`);
 
-        if (url.pathname === "/callback") {
-          const code = url.searchParams.get("code");
+      if (url.pathname === "/callback") {
+        const code = url.searchParams.get("code");
 
-          if (code) {
-            try {
-              // Exchange code for tokens using PKCE
-              const tokenUrl = "https://identity.xero.com/connect/token";
-              const body = new URLSearchParams({
-                grant_type: "authorization_code",
-                code: code,
-                redirect_uri: redirectUri,
-                client_id: clientId,
-                code_verifier: codeVerifier,
-              });
+        if (code) {
+          try {
+            // Exchange code for tokens using PKCE
+            const tokenUrl = "https://identity.xero.com/connect/token";
+            const body = new URLSearchParams({
+              grant_type: "authorization_code",
+              code: code,
+              redirect_uri: redirectUri,
+              client_id: clientId,
+              code_verifier: codeVerifier,
+            });
 
-              // Add client_secret if available (Web app mode)
-              if (clientSecret) {
-                body.set("client_secret", clientSecret);
-              }
-
-              const tokenResponse = await fetch(tokenUrl, {
-                method: "POST",
-                headers: { "Content-Type": "application/x-www-form-urlencoded" },
-                body: body.toString(),
-              });
-
-              if (!tokenResponse.ok) {
-                const errorText = await tokenResponse.text();
-                throw new Error(`Token exchange failed: ${errorText}`);
-              }
-
-              const tokens = await tokenResponse.json();
-
-              // Set tokens on XeroClient
-              this.xero.setTokenSet(tokens);
-              this.saveTokens();
-
-              const tenants = await this.xero.updateTenants();
-              this.tenantId = tenants[0]?.tenantId;
-
-              res.writeHead(200, { "Content-Type": "text/html" });
-              res.end("<h1>Authentication successful!</h1><p>You can close this window.</p>");
-              server.close();
-              resolve(true);
-            } catch (error) {
-              res.writeHead(500, { "Content-Type": "text/html" });
-              res.end(`<h1>Error</h1><p>${error.message}</p>`);
-              server.close();
-              reject(error);
+            // Add client_secret if available (Web app mode)
+            if (clientSecret) {
+              body.set("client_secret", clientSecret);
             }
+
+            const tokenResponse = await fetch(tokenUrl, {
+              method: "POST",
+              headers: { "Content-Type": "application/x-www-form-urlencoded" },
+              body: body.toString(),
+            });
+
+            if (!tokenResponse.ok) {
+              const errorText = await tokenResponse.text();
+              throw new Error(`Token exchange failed: ${errorText}`);
+            }
+
+            const tokens = await tokenResponse.json();
+
+            // Set tokens on XeroClient
+            this.xero.setTokenSet(tokens);
+            this.saveTokens();
+
+            const tenants = await this.xero.updateTenants();
+            this.tenantId = tenants[0]?.tenantId;
+
+            res.writeHead(200, { "Content-Type": "text/html" });
+            res.end("<h1>Authentication successful!</h1><p>You can close this window and return to your assistant.</p>");
+          } catch (error) {
+            res.writeHead(500, { "Content-Type": "text/html" });
+            res.end(`<h1>Authentication Error</h1><p>${error.message}</p>`);
+            console.error("Xero OAuth callback error:", error.message);
+          } finally {
+            this.callbackServer.close();
+            this.callbackServer = null;
           }
         }
-      });
-
-      server.listen(port, async () => {
-        console.error(`Opening browser for Xero authentication on port ${port}...`);
-        await open(authUrl.toString());
-      });
-
-      setTimeout(() => {
-        server.close();
-        reject(new Error("Authentication timed out after 5 minutes"));
-      }, 300000);
+      }
     });
+
+    this.callbackServer.listen(port, async () => {
+      console.error(`Xero authentication required. Opening browser on port ${port}...`);
+      await open(authUrl.toString());
+    });
+
+    // Clean up the server if the user never completes auth
+    setTimeout(() => {
+      if (this.callbackServer) {
+        this.callbackServer.close();
+        this.callbackServer = null;
+        console.error("Authentication timed out after 5 minutes");
+      }
+    }, 300000);
+
+    // Throw immediately so the tool call returns to the user right away.
+    // The callback server continues running in the background.
+    throw new Error(
+      "Xero authentication required. A browser window has been opened — please sign in to Xero there. " +
+      "Once you have completed the sign-in, retry this tool call."
+    );
   }
 
   async ensureAuthenticated() {
