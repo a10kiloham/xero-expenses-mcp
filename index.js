@@ -52,11 +52,17 @@ class XeroExpensesMCP {
         "openid",
         "profile",
         "email",
-        "accounting.transactions",
-        "accounting.contacts",
-        "accounting.settings.read",
+        "accounting.invoices",
+        "accounting.payments",
+        "accounting.banktransactions",
+        "accounting.manualjournals",
+        "accounting.reports",
+        "accounting.settings",
         "accounting.attachments",
-        "offline_access",
+        "accounting.contacts",
+        "files",
+        "bankfeeds",
+        "offline_access"
       ],
     };
 
@@ -67,6 +73,7 @@ class XeroExpensesMCP {
     }
 
     this.xero = new XeroClient(config);
+    this.scopes = config.scopes;
     this.tenantId = null;
 
     // Ensure token directory exists
@@ -110,12 +117,8 @@ class XeroExpensesMCP {
     const codeVerifier = generateCodeVerifier();
     const codeChallenge = generateCodeChallenge(codeVerifier);
 
-    // Build authorization URL
-    const scopes = [
-      "openid", "profile", "email",
-      "accounting.transactions", "accounting.contacts",
-      "accounting.settings.read", "accounting.attachments", "offline_access"
-    ].join(" ");
+    // Build authorization URL using the same scopes as the XeroClient config
+    const scopes = this.scopes.join(" ");
 
     const authUrl = new URL("https://login.xero.com/identity/connect/authorize");
     authUrl.searchParams.set("response_type", "code");
