@@ -87,8 +87,16 @@ class XeroExpensesMCP {
 
       const tokenSet = this.xero.readTokenSet();
       if (tokenSet && tokenSet.expired && tokenSet.expired()) {
-        await this.xero.refreshToken();
-        this.saveTokens();
+        try {
+          await this.xero.refreshToken();
+          this.saveTokens();
+        } catch (refreshError) {
+          // Refresh token is expired (60-day limit) or revoked — delete saved
+          // tokens so the caller triggers a clean re-authentication flow.
+          console.error("Xero refresh token expired or invalid — re-authentication required:", refreshError.message);
+          try { writeFileSync(TOKEN_PATH, "{}"); } catch (_) { /* ignore */ }
+          return false;
+        }
       }
 
       const tenants = await this.xero.updateTenants();
