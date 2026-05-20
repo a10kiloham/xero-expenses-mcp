@@ -1,0 +1,22 @@
+# Tests
+test/
+tests/
+__tests__/
+*.test.js
+*.spec.js
+
+# Config files
+.eslintrc*
+.prettierrc*
+.editorconfig
+.gitignore
+.npmignore
+.github/
+
+# Source files if you compile (not applicable here as it's just index.js, but good practice)
+# src/
+
+# Environment
+.env
+.env.*
+.xero-mcp/
