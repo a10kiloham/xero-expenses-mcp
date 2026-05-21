@@ -1103,6 +1103,103 @@ class XeroExpensesMCP {
       hasAttachments: r.hasAttachments,
     }));
   }
+
+  async authorizeBill(invoiceId) {
+    await this.ensureAuthenticated();
+
+    const response = await this.xero.accountingApi.updateOrCreateInvoices(
+      this.tenantId,
+      {
+        invoices: [
+          {
+            invoiceID: invoiceId,
+            status: 'AUTHORISED',
+          },
+        ],
+      },
+      /* summarizeErrors = */ false,
+    );
+
+    const inv = response.body.invoices && response.body.invoices[0];
+    if (!inv) {
+      throw new Error(`No invoice returned for ${invoiceId}`);
+    }
+    if (inv.hasErrors || (inv.validationErrors && inv.validationErrors.length)) {
+      const msgs = (inv.validationErrors || []).map((e) => e.message).join('; ');
+      throw new Error(`Xero rejected authorisation of ${invoiceId}: ${msgs}`);
+    }
+
+    return {
+      invoiceId: inv.invoiceID,
+      reference: inv.reference,
+      vendor: inv.contact?.name,
+      total: inv.total,
+      amountDue: inv.amountDue,
+      status: inv.status,
+      type: inv.type,
+    };
+  }
+
+  async createPayment({ invoiceId, accountCode, accountId, date, amount, reference }) {
+    await this.ensureAuthenticated();
+
+    if (!accountCode && !accountId) {
+      throw new Error('Provide accountCode OR accountId for the payment source');
+    }
+    if (accountCode && accountId) {
+      throw new Error('Provide accountCode OR accountId, not both');
+    }
+
+    // If amount not supplied, look up the bill's outstanding balance so the
+    // payment fully settles it.
+    let paymentAmount = amount;
+    if (paymentAmount == null) {
+      const billResp = await this.xero.accountingApi.getInvoice(this.tenantId, invoiceId);
+      const bill = billResp.body.invoices && billResp.body.invoices[0];
+      if (!bill) throw new Error(`Bill ${invoiceId} not found`);
+      if (bill.status !== 'AUTHORISED') {
+        throw new Error(
+          `Bill ${invoiceId} has status ${bill.status} — must be AUTHORISED before recording a payment. ` +
+          `Call xero_authorize_bill first.`,
+        );
+      }
+      paymentAmount = bill.amountDue;
+      if (paymentAmount <= 0) {
+        throw new Error(`Bill ${invoiceId} has amountDue=${paymentAmount} — already paid?`);
+      }
+    }
+
+    const payment = {
+      invoice: { invoiceID: invoiceId },
+      account: accountCode ? { code: accountCode } : { accountID: accountId },
+      date: date,
+      amount: paymentAmount,
+    };
+    if (reference) payment.reference = reference;
+
+    const response = await this.xero.accountingApi.createPayments(this.tenantId, {
+      payments: [payment],
+    });
+
+    const created = response.body.payments && response.body.payments[0];
+    if (!created) {
+      throw new Error(`No payment returned for invoice ${invoiceId}`);
+    }
+    if (created.hasErrors || (created.validationErrors && created.validationErrors.length)) {
+      const msgs = (created.validationErrors || []).map((e) => e.message).join('; ');
+      throw new Error(`Xero rejected payment for ${invoiceId}: ${msgs}`);
+    }
+
+    return {
+      paymentId: created.paymentID,
+      invoiceId: created.invoice?.invoiceID,
+      account: created.account?.code || created.account?.accountID,
+      date: created.date,
+      amount: created.amount,
+      reference: created.reference,
+      status: created.status,
+    };
+  }
 }
 
 // MCP Server setup
@@ -1428,6 +1525,65 @@ server.setRequestHandler(ListToolsRequestSchema, async () => ({
         },
       },
     },
+    {
+      name: "xero_authorize_bill",
+      description:
+        "Approve a bill: move a DRAFT or SUBMITTED ACCPAY invoice to AUTHORISED status. " +
+        "AUTHORISED bills appear in \"Awaiting Payment\" in Xero and post their input VAT " +
+        "to the VAT return on the bill date.",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: {
+            type: "string",
+            description: "The Xero InvoiceID (UUID) of the bill to authorise.",
+          },
+        },
+        required: ["invoiceId"],
+      },
+    },
+    {
+      name: "xero_create_payment",
+      description:
+        "Record a payment against an AUTHORISED bill (ACCPAY invoice). The source " +
+        "account MUST be a BANK-type account in Xero — regular asset/expense accounts " +
+        "will be rejected. If \"625 Cash in Hand\" isn't showing up, add it as a Bank " +
+        "account in Accounting → Bank accounts → Add Bank Account → \"Add it anyway\".",
+      inputSchema: {
+        type: "object",
+        properties: {
+          invoiceId: {
+            type: "string",
+            description: "The Xero InvoiceID (UUID) of the bill being paid.",
+          },
+          accountCode: {
+            type: "string",
+            description:
+              "Code of the BANK-type account to pay from (e.g., \"625\" for Cash in Hand). " +
+              "Provide either accountCode OR accountId, not both.",
+          },
+          accountId: {
+            type: "string",
+            description: "UUID of the BANK-type account (alternative to accountCode).",
+          },
+          date: {
+            type: "string",
+            description: "Payment date in YYYY-MM-DD format (e.g., \"2025-09-20\").",
+          },
+          amount: {
+            type: "number",
+            description:
+              "Payment amount. Optional — if omitted, defaults to the bill's " +
+              "outstanding balance (AmountDue), which fully settles the bill.",
+          },
+          reference: {
+            type: "string",
+            description: "Optional payment reference / memo.",
+          },
+        },
+        required: ["invoiceId", "date"],
+      },
+    },
   ],
 }));
 
@@ -1617,6 +1773,20 @@ server.setRequestHandler(CallToolRequestSchema, async (request) => {
 
       case "xero_list_receipts": {
         const result = await xeroExpenses.listReceipts(args.userId);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_authorize_bill": {
+        const result = await xeroExpenses.authorizeBill(args.invoiceId);
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        };
+      }
+
+      case "xero_create_payment": {
+        const result = await xeroExpenses.createPayment(args);
         return {
           content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
         };
