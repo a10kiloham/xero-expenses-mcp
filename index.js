@@ -81,36 +81,77 @@ class XeroExpensesMCP {
   }
 
   async loadTokens() {
-    if (existsSync(TOKEN_PATH)) {
-      const tokens = JSON.parse(readFileSync(TOKEN_PATH, "utf8"));
-      this.xero.setTokenSet(tokens);
+    if (!existsSync(TOKEN_PATH)) return false;
 
-      const tokenSet = this.xero.readTokenSet();
-      if (tokenSet && tokenSet.expired && tokenSet.expired()) {
-        try {
-          await this.xero.refreshToken();
-          this.saveTokens();
-        } catch (refreshError) {
-          // Refresh token is expired (60-day limit) or revoked — delete saved
-          // tokens so the caller triggers a clean re-authentication flow.
-          console.error("Xero refresh token expired or invalid — re-authentication required:", refreshError.message);
-          try { writeFileSync(TOKEN_PATH, "{}"); } catch (_) { /* ignore */ }
-          return false;
-        }
-      }
-
-      const tenants = await this.xero.updateTenants();
-      this.tenantId = tenants[0]?.tenantId;
-      return true;
+    let tokens;
+    try {
+      tokens = JSON.parse(readFileSync(TOKEN_PATH, "utf8"));
+    } catch (_) {
+      return false;
     }
-    return false;
+
+    // Guard: must have a refresh_token to be usable
+    if (!tokens || !tokens.refresh_token) return false;
+
+    this.xero.setTokenSet(tokens);
+
+    // Proactively refresh if the access token is expired OR expiring within 5 minutes.
+    // This ensures we always capture the rotated refresh token before making API calls.
+    const tokenSet = this.xero.readTokenSet();
+    const expiresAt = tokenSet?.expires_at; // unix seconds (from openid-client)
+    const secondsUntilExpiry = expiresAt ? expiresAt - Date.now() / 1000 : -1;
+    const shouldRefresh =
+      (tokenSet?.expired && tokenSet.expired()) || secondsUntilExpiry < 300;
+
+    if (shouldRefresh) {
+      try {
+        await this.xero.refreshToken();
+        // Save immediately — Xero rotates the refresh token on every use.
+        // Failing to persist here is what causes daily re-auth.
+        this.saveTokens();
+      } catch (refreshError) {
+        // Refresh token is expired (60-day limit) or revoked — delete saved
+        // tokens so the caller triggers a clean re-authentication flow.
+        console.error(
+          "Xero refresh token expired or invalid — re-authentication required:",
+          refreshError.message
+        );
+        try { writeFileSync(TOKEN_PATH, "{}"); } catch (_) { /* ignore */ }
+        return false;
+      }
+    }
+
+    const tenants = await this.xero.updateTenants();
+    this.tenantId = tenants[0]?.tenantId;
+
+    // Always save after updateTenants() — the xero-node SDK may have silently
+    // rotated the refresh token during this call.  Without this save the old
+    // (now-invalidated) refresh token remains on disk and causes re-auth on
+    // the next process restart.
+    this.saveTokens();
+
+    return true;
   }
 
   saveTokens() {
     const tokenSet = this.xero.readTokenSet();
-    if (tokenSet) {
+    if (tokenSet && Object.keys(tokenSet).length > 0) {
       writeFileSync(TOKEN_PATH, JSON.stringify(tokenSet, null, 2));
     }
+  }
+
+  /**
+   * Returns true when the current in-memory access token is expired or will
+   * expire within `bufferSeconds` (default 5 minutes).  Used by
+   * ensureAuthenticated() to proactively refresh mid-session.
+   */
+  isTokenExpiringSoon(bufferSeconds = 300) {
+    const tokenSet = this.xero.readTokenSet();
+    if (!tokenSet) return true;
+    if (tokenSet.expired && tokenSet.expired()) return true;
+    const expiresAt = tokenSet.expires_at; // unix seconds
+    if (expiresAt == null) return false;
+    return expiresAt - Date.now() / 1000 < bufferSeconds;
   }
 
   async authenticate() {
@@ -225,6 +266,28 @@ class XeroExpensesMCP {
   }
 
   async ensureAuthenticated() {
+    // Fast path: already authenticated this session — just check token health.
+    // Calling loadTokens() (and updateTenants()) on every single tool invocation
+    // is expensive AND dangerous: updateTenants() can silently rotate the
+    // refresh token and those rotated tokens were never being saved, which is
+    // the primary cause of daily re-authentication.
+    if (this.tenantId) {
+      if (this.isTokenExpiringSoon()) {
+        try {
+          await this.xero.refreshToken();
+          this.saveTokens();
+        } catch (error) {
+          // Refresh failed mid-session — fall through to full re-auth below.
+          console.error("Mid-session token refresh failed:", error.message);
+          this.tenantId = null;
+          try { writeFileSync(TOKEN_PATH, "{}"); } catch (_) { /* ignore */ }
+          await this.authenticate();
+        }
+      }
+      return true;
+    }
+
+    // Slow path: first call this session — load from disk.
     const hasTokens = await this.loadTokens().catch(() => false);
     if (!hasTokens || !this.tenantId) {
       await this.authenticate();
